@@ -1,6 +1,6 @@
 export type LayerId = string
 
-export type Platform = 'linkedin' | 'instagram' | 'facebook' | 'generic'
+export type Platform = 'linkedin' | 'instagram' | 'facebook' | 'generic' | 'email'
 
 export interface AdFormat {
   id: string
