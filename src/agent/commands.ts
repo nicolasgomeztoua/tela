@@ -355,14 +355,14 @@ const COMMANDS: Record<string, CommandDef> = {
 
   // ── Export ────────────────────────────────────────────────────────────
   exportFrame: {
-    description: 'Composite the frame to a PNG or JPG and return a blob plus data URL. Defaults to the active frame when frameId is omitted.',
+    description: 'Composite the frame and return a PNG data URL (data:image/png;base64,...) as the primary result for ingest — no file download. Defaults to the active frame when frameId is omitted. format "jpg" is optional.',
     params: {
       frameId: 'string? — frame to export (default: active frame)',
-      format: 'png|jpg',
+      format: 'png|jpg? (default png — primary result is always a data URL; png is data:image/png;base64)',
       scale: 'number? — export scale / DPR (default 1)',
     },
     handler: async (a) => {
-      const format = a.format as string
+      const format = a.format == null ? 'png' : a.format as string
       if (format !== 'png' && format !== 'jpg') throw new Error('format must be "png" or "jpg"')
       const scale = a.scale == null ? 1 : requireFiniteNumber(a.scale, 'scale')
       if (scale <= 0) throw new Error('scale must be > 0')
@@ -374,13 +374,16 @@ const COMMANDS: Record<string, CommandDef> = {
         dpr: scale,
       })
       const dataUrl = await blobToDataUrl(blob)
+      const mimeType = format === 'jpg' ? 'image/jpeg' : 'image/png'
       return {
-        frameId,
-        blob,
+        // Primary result for Asset Maker ingest (no download). PNG default is
+        // data:image/png;base64,...
         dataUrl,
-        mimeType: blob.type || (format === 'jpg' ? 'image/jpeg' : 'image/png'),
+        mimeType,
         width: Math.round(doc.format.width * scale),
         height: Math.round(doc.format.height * scale),
+        frameId,
+        blob,
       }
     },
   },
