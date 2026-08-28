@@ -1,5 +1,14 @@
 import { dispatch, getSchema } from './commands'
 
+declare global {
+  interface Window {
+    tela: {
+      dispatch: typeof dispatch
+      getSchema: typeof getSchema
+    }
+  }
+}
+
 /**
  * Agent RPC bridge. Lets a parent window (a host app, or an agent harness driving the
  * iframe) run canvas commands over postMessage, and also exposes a direct
@@ -33,7 +42,7 @@ export function installAgentRpc(): () => void {
 
   // Direct handle: an agent scripting the page (or you, in devtools) can call
   // window.tela.dispatch({ op:'getSchema' }) without postMessage plumbing.
-  ;(window as unknown as { tela: unknown }).tela = { dispatch, getSchema }
+  window.tela = { dispatch, getSchema }
 
   const onMessage = async (e: MessageEvent) => {
     if (!isCommandMessage(e.data)) return

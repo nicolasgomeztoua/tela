@@ -4,7 +4,9 @@ import { relayoutActiveFrame } from '@/store/useAIStore'
 import { getTextBounds, createMeasureContext } from '@/engine/textMeasure'
 import { AD_FORMATS } from '@/brand/formats'
 import { getBrandColor } from '@/brand/palette'
-import type { FontWeight, LayerConstraints, TextLayer } from '@/types/design'
+import { exportDesign } from '@/engine/compositor'
+import { loadImage } from '@/engine/renderers/imageCache'
+import type { AdFormat, DesignDocument, FontWeight, ImageLayer, LayerConstraints, TextLayer } from '@/types/design'
 
 /**
  * The canvas command bus — one typed, introspectable surface for driving the
@@ -34,6 +36,60 @@ const formatById = (id: unknown) => {
   const fmt = AD_FORMATS.find((f) => f.id === id)
   if (!fmt) throw new Error(`Unknown formatId "${String(id)}". Options: ${AD_FORMATS.map((f) => f.id).join(', ')}`)
   return fmt
+}
+
+function requireFiniteNumber(value: unknown, name: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${name} must be a finite number`)
+  return value
+}
+
+function customSizeFormat(base: AdFormat, width: number, height: number): AdFormat {
+  const w = Math.max(1, Math.round(width))
+  const h = Math.max(1, Math.round(height))
+  return { ...base, width: w, height: h, label: 'Custom', aspectRatio: `${w}:${h}` }
+}
+
+const IMAGE_FITS = new Set<ImageLayer['fit']>(['cover', 'contain', 'fill'])
+
+function documentForFrame(frameId?: string): { frameId: string; doc: DesignDocument } {
+  const ws = useWorkspaceStore.getState()
+  const id = frameId || ws.activeFrameId
+  if (!id) throw new Error('No active frame. Pass frameId or select a frame first.')
+  if (id === ws.activeFrameId) return { frameId: id, doc: useDesignStore.getState().document }
+  const frame = ws.getFrame(id)
+  if (!frame) throw new Error(`Unknown frameId "${id}"`)
+  return {
+    frameId: id,
+    doc: {
+      id: frame.id,
+      name: frame.name,
+      format: frame.format,
+      layers: frame.layers,
+      createdAt: '',
+      updatedAt: '',
+      autoLayouts: frame.autoLayouts,
+    },
+  }
+}
+
+function imageUrlsInDocument(doc: DesignDocument): string[] {
+  const urls: string[] = []
+  for (const layer of doc.layers) {
+    if (layer.type === 'image' && layer.imageUrl) urls.push(layer.imageUrl)
+    if (layer.type === 'background' && layer.fill.type === 'image' && layer.fill.imageUrl) {
+      urls.push(layer.fill.imageUrl)
+    }
+  }
+  return urls
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read blob'))
+    reader.readAsDataURL(blob)
+  })
 }
 
 /** Serializable snapshot an agent reads to understand current state. The active
@@ -76,7 +132,7 @@ const COMMANDS: Record<string, CommandDef> = {
   listFormats: {
     description: 'All ad formats you can assign to a frame.',
     params: {},
-    handler: () => AD_FORMATS.map((f) => ({ id: f.id, label: f.label, width: f.width, height: f.height, aspectRatio: f.aspectRatio })),
+    handler: () => AD_FORMATS.map((f) => ({ id: f.id, label: f.label, platform: f.platform, width: f.width, height: f.height, aspectRatio: f.aspectRatio })),
   },
 
   // ── Frames ────────────────────────────────────────────────────────────
@@ -115,6 +171,26 @@ const COMMANDS: Record<string, CommandDef> = {
     handler: (a) => {
       useWorkspaceStore.getState().setFrameFormat(a.frameId as string, formatById(a.formatId))
       return { ok: true }
+    },
+  },
+  setFrameSize: {
+    description: 'Resize a frame to a custom pixel size. Layers reflow the same way as setFrameFormat. Defaults to the active frame when frameId is omitted.',
+    params: { frameId: 'string? — frame to resize (default: active frame)', width: 'number — pixel width', height: 'number — pixel height' },
+    handler: (a) => {
+      const ws = useWorkspaceStore.getState()
+      const frameId = (a.frameId as string | undefined) ?? ws.activeFrameId
+      if (!frameId) throw new Error('No active frame. Pass frameId or select a frame first.')
+      const frame = ws.getFrame(frameId)
+      if (!frame) throw new Error(`Unknown frameId "${frameId}"`)
+      const width = Math.round(requireFiniteNumber(a.width, 'width'))
+      const height = Math.round(requireFiniteNumber(a.height, 'height'))
+      if (width < 1 || height < 1) throw new Error('width and height must be >= 1')
+      const base = frameId === ws.activeFrameId
+        ? useDesignStore.getState().document.format
+        : frame.format
+      const format = customSizeFormat(base, width, height)
+      ws.setFrameFormat(frameId, format)
+      return { frameId, width: format.width, height: format.height }
     },
   },
   selectFrame: {
@@ -191,6 +267,43 @@ const COMMANDS: Record<string, CommandDef> = {
       return { layerId }
     },
   },
+  addImage: {
+    description: 'Place an image on the active frame at the given box. Same image-layer path as the file picker. Returns its layer id.',
+    params: {
+      imageUrl: 'string? — http(s) or data URL',
+      dataUrl: 'string? — alias of imageUrl (one of imageUrl or dataUrl is required)',
+      x: 'number', y: 'number', width: 'number', height: 'number',
+      fit: 'cover|contain|fill? (default cover — same as the file picker)',
+    },
+    handler: async (a) => {
+      const imageUrl = (typeof a.imageUrl === 'string' && a.imageUrl)
+        || (typeof a.dataUrl === 'string' && a.dataUrl)
+        || ''
+      if (!imageUrl) throw new Error('addImage requires imageUrl or dataUrl')
+      const x = requireFiniteNumber(a.x, 'x')
+      const y = requireFiniteNumber(a.y, 'y')
+      const width = requireFiniteNumber(a.width, 'width')
+      const height = requireFiniteNumber(a.height, 'height')
+      const fit = (a.fit as ImageLayer['fit'] | undefined) ?? 'cover'
+      if (!IMAGE_FITS.has(fit)) throw new Error('fit must be "cover", "contain", or "fill"')
+      const layerId = useDesignStore.getState().addLayer({
+        type: 'image',
+        name: 'Image',
+        visible: true,
+        locked: false,
+        opacity: 1,
+        x, y, width, height,
+        rotation: 0,
+        imageUrl,
+        fit,
+        cropX: 0, cropY: 0, cropW: 1, cropH: 1,
+        borderRadius: 0,
+        aspectRatioLocked: true,
+      })
+      await loadImage(imageUrl).catch(() => null)
+      return { layerId }
+    },
+  },
   updateLayer: {
     description: 'Patch fields on a layer in the active frame (e.g. { x, y, width, height, opacity, content, fontSize, fill }).',
     params: { layerId: 'string', patch: 'object — fields to merge onto the layer' },
@@ -237,6 +350,41 @@ const COMMANDS: Record<string, CommandDef> = {
     handler: (a) => {
       useDesignStore.getState().selectLayer(a.layerId as string)
       return { ok: true }
+    },
+  },
+
+  // ── Export ────────────────────────────────────────────────────────────
+  exportFrame: {
+    description: 'Composite the frame and return a PNG data URL (data:image/png;base64,...) as the primary result for ingest — no file download. Defaults to the active frame when frameId is omitted. format "jpg" is optional.',
+    params: {
+      frameId: 'string? — frame to export (default: active frame)',
+      format: 'png|jpg? (default png — primary result is always a data URL; png is data:image/png;base64)',
+      scale: 'number? — export scale / DPR (default 1)',
+    },
+    handler: async (a) => {
+      const format = a.format == null ? 'png' : a.format as string
+      if (format !== 'png' && format !== 'jpg') throw new Error('format must be "png" or "jpg"')
+      const scale = a.scale == null ? 1 : requireFiniteNumber(a.scale, 'scale')
+      if (scale <= 0) throw new Error('scale must be > 0')
+      const { frameId, doc } = documentForFrame(a.frameId as string | undefined)
+      await Promise.all(imageUrlsInDocument(doc).map((url) => loadImage(url).catch(() => null)))
+      const blob = await exportDesign(doc, {
+        format,
+        quality: 0.92,
+        dpr: scale,
+      })
+      const dataUrl = await blobToDataUrl(blob)
+      const mimeType = format === 'jpg' ? 'image/jpeg' : 'image/png'
+      return {
+        // Primary result for Asset Maker ingest (no download). PNG default is
+        // data:image/png;base64,...
+        dataUrl,
+        mimeType,
+        width: Math.round(doc.format.width * scale),
+        height: Math.round(doc.format.height * scale),
+        frameId,
+        blob,
+      }
     },
   },
 

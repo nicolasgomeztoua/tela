@@ -7,6 +7,7 @@ const PLATFORM_LABELS: Record<string, string> = {
   instagram: 'Instagram',
   facebook: 'Facebook',
   generic: 'Generic',
+  email: 'Email',
 }
 
 interface Props {
